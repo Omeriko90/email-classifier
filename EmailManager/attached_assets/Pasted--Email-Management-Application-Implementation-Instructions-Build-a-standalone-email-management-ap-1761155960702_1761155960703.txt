@@ -1,0 +1,929 @@
+# Email Management Application - Implementation Instructions
+
+Build a standalone email management application that allows users to integrate their Gmail or Outlook accounts, classify emails with custom labels, and create automated workflows for email summarization.
+
+## Tech Stack Requirements
+
+**Frontend:**
+- React with TypeScript
+- Vite for build tooling
+- React Router for navigation
+- TanStack Query (React Query) for API state management
+- Tailwind CSS + Headless UI for styling
+- Recharts for data visualizations
+- Axios for HTTP requests
+
+**Backend:**
+- Node.js with Express and TypeScript
+- PostgreSQL database with Prisma ORM
+- Passport.js for OAuth2 authentication
+- Bull queue for job scheduling
+- JWT for session management
+
+**External APIs:**
+- Google OAuth2 and Gmail API
+- Microsoft Graph API for Outlook
+- OpenAI API for email classification and summarization
+
+## Step 1: Project Initialization
+
+Create a new directory structure:
+```
+email-manager/
+├── frontend/
+├── backend/
+└── shared/
+```
+
+Initialize both frontend and backend as separate npm projects with TypeScript.
+
+## Step 2: Backend Setup
+
+### 2.1 Initialize Backend
+
+In the `backend/` directory:
+- Initialize npm project with TypeScript
+- Install dependencies: `express`, `@types/express`, `typescript`, `ts-node`, `prisma`, `@prisma/client`, `passport`, `passport-google-oauth20`, `passport-microsoft`, `googleapis`, `@microsoft/microsoft-graph-client`, `openai`, `bull`, `jsonwebtoken`, `bcrypt`, `cors`, `dotenv`, `express-rate-limit`
+
+### 2.2 Configure Prisma and Database Schema
+
+Initialize Prisma and create the following schema in `prisma/schema.prisma`:
+
+```prisma
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id            String         @id @default(uuid())
+  email         String         @unique
+  name          String?
+  passwordHash  String?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  emailAccounts EmailAccount[]
+  labels        Label[]
+  workflows     Workflow[]
+}
+
+model EmailAccount {
+  id                   String    @id @default(uuid())
+  userId               String
+  user                 User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider             String    // "gmail" or "outlook"
+  email                String
+  accessToken          String    // Encrypt this in production
+  refreshToken         String    // Encrypt this in production
+  tokenExpiry          DateTime?
+  webhookSubscriptionId String?
+  webhookExpiry        DateTime?
+  lastSyncedAt         DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+  emails               Email[]
+  
+  @@unique([userId, email])
+}
+
+model Email {
+  id             String        @id @default(uuid())
+  emailAccountId String
+  emailAccount   EmailAccount  @relation(fields: [emailAccountId], references: [id], onDelete: Cascade)
+  messageId      String        // Provider's unique ID
+  subject        String
+  sender         String
+  senderEmail    String
+  receivedAt     DateTime
+  bodyPreview    String        @db.Text
+  bodyFull       String?       @db.Text
+  isRead         Boolean       @default(false)
+  createdAt      DateTime      @default(now())
+  labels         EmailLabel[]
+  
+  @@unique([emailAccountId, messageId])
+  @@index([emailAccountId, receivedAt])
+}
+
+model Label {
+  id          String       @id @default(uuid())
+  userId      String
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name        String
+  color       String
+  description String?
+  createdAt   DateTime     @default(now())
+  emails      EmailLabel[]
+  
+  @@unique([userId, name])
+}
+
+model EmailLabel {
+  id        String   @id @default(uuid())
+  emailId   String
+  email     Email    @relation(fields: [emailId], references: [id], onDelete: Cascade)
+  labelId   String
+  label     Label    @relation(fields: [labelId], references: [id], onDelete: Cascade)
+  isAuto    Boolean  @default(false) // true if classified by AI
+  createdAt DateTime @default(now())
+  
+  @@unique([emailId, labelId])
+}
+
+model Workflow {
+  id          String              @id @default(uuid())
+  userId      String
+  user        User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  frequency   String              // "weekly" or "biweekly"
+  filters     Json                // { labelIds: [], keywords: [], dateRange: {} }
+  prompt      String              @db.Text
+  isActive    Boolean             @default(true)
+  lastRunAt   DateTime?
+  nextRunAt   DateTime
+  createdAt   DateTime            @default(now())
+  executions  WorkflowExecution[]
+}
+
+model WorkflowExecution {
+  id         String   @id @default(uuid())
+  workflowId String
+  workflow   Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  summary    String   @db.Text
+  emailCount Int
+  executedAt DateTime @default(now())
+  
+  @@index([workflowId, executedAt])
+}
+```
+
+Run `npx prisma migrate dev` to create the database.
+
+### 2.3 Create Backend Structure
+
+Create the following directory structure in `backend/src/`:
+```
+src/
+├── config/
+│   ├── database.ts
+│   ├── passport.ts
+│   └── env.ts
+├── routes/
+│   ├── auth.routes.ts
+│   ├── emails.routes.ts
+│   ├── labels.routes.ts
+│   ├── workflows.routes.ts
+│   └── webhooks.routes.ts
+├── services/
+│   ├── gmail.service.ts
+│   ├── outlook.service.ts
+│   ├── classification.service.ts
+│   ├── workflow.service.ts
+│   └── webhook.service.ts
+├── middleware/
+│   ├── auth.middleware.ts
+│   └── error.middleware.ts
+├── jobs/
+│   └── workflow.job.ts
+├── utils/
+│   └── encryption.ts
+└── index.ts
+```
+
+### 2.4 Implement OAuth Authentication
+
+In `src/config/passport.ts`, configure Passport.js strategies for:
+- Google OAuth2 (passport-google-oauth20)
+- Microsoft OAuth2 (passport-microsoft)
+
+Create routes in `src/routes/auth.routes.ts`:
+- `GET /auth/google` - Initiate Google OAuth flow with Gmail scopes
+- `GET /auth/google/callback` - Handle callback, store tokens
+- `GET /auth/microsoft` - Initiate Microsoft OAuth flow with Mail.Read scope
+- `GET /auth/microsoft/callback` - Handle callback, store tokens
+- `POST /auth/logout` - Clear session
+
+After successful authentication, register webhooks for the connected account.
+
+### 2.5 Implement Webhook System
+
+In `src/services/webhook.service.ts`:
+
+**For Gmail:**
+- Use Gmail Push Notifications with Cloud Pub/Sub
+- After user connects Gmail, call `gmail.users.watch()` API
+- Set up Cloud Pub/Sub topic and subscription
+- Store subscription details in `EmailAccount.webhookSubscriptionId`
+- Implement renewal logic (subscriptions expire every 7 days)
+
+**For Outlook:**
+- Use Microsoft Graph API subscription endpoint
+- Create subscription for `/me/mailFolders('Inbox')/messages`
+- Set webhook URL to your public endpoint
+- Store subscription ID and expiry
+- Implement renewal logic (subscriptions expire after 3 days by default)
+
+In `src/routes/webhooks.routes.ts`:
+- `POST /api/webhooks/gmail` - Receive Gmail push notifications
+- `POST /api/webhooks/outlook` - Receive Outlook webhook notifications
+- Verify webhook signatures
+- Trigger immediate email sync when notification received
+
+### 2.6 Implement Email Sync Services
+
+In `src/services/gmail.service.ts`:
+- `syncHistoricalEmails(accountId)` - Initial sync on connection
+- `syncNewEmails(accountId, messageIds)` - Sync specific messages from webhook
+- Use `googleapis` package to fetch email data
+- Store in database with proper error handling
+
+In `src/services/outlook.service.ts`:
+- Similar functions using `@microsoft/microsoft-graph-client`
+- Fetch messages from `/me/messages` endpoint
+- Parse and store email data
+
+### 2.7 Implement AI Classification
+
+In `src/services/classification.service.ts`:
+```typescript
+async function classifyEmail(emailId: string, userId: string) {
+  // Get email content
+  const email = await prisma.email.findUnique({ where: { id: emailId } });
+  
+  // Get user's labels
+  const labels = await prisma.label.findMany({ where: { userId } });
+  
+  // Call OpenAI API
+  const prompt = `Classify this email into one or more of these categories: ${labels.map(l => l.name).join(', ')}
+  
+  Email Subject: ${email.subject}
+  Email Body: ${email.bodyPreview}
+  
+  Return only the category names as a JSON array.`;
+  
+  const response = await openai.chat.completions.create({
+    model: "gpt-4",
+    messages: [{ role: "user", content: prompt }],
+    response_format: { type: "json_object" }
+  });
+  
+  // Parse and apply labels
+  const categories = JSON.parse(response.choices[0].message.content);
+  // Save to EmailLabel table with isAuto = true
+}
+```
+
+Create endpoint in `src/routes/emails.routes.ts`:
+- `POST /api/emails/:id/classify` - Trigger classification for one email
+- `POST /api/emails/batch-classify` - Classify multiple emails
+
+### 2.8 Implement Workflows
+
+In `src/services/workflow.service.ts`:
+```typescript
+async function executeWorkflow(workflowId: string) {
+  const workflow = await prisma.workflow.findUnique({ 
+    where: { id: workflowId },
+    include: { user: true }
+  });
+  
+  // Query emails based on workflow filters
+  const filters = workflow.filters as any;
+  const emails = await prisma.email.findMany({
+    where: {
+      emailAccount: { userId: workflow.userId },
+      labels: { some: { labelId: { in: filters.labelIds } } },
+      receivedAt: { gte: filters.dateRange?.start, lte: filters.dateRange?.end }
+    },
+    include: { labels: { include: { label: true } } }
+  });
+  
+  // Send to AI for summarization
+  const emailTexts = emails.map(e => `Subject: ${e.subject}\nFrom: ${e.sender}\n${e.bodyPreview}`).join('\n\n---\n\n');
+  
+  const response = await openai.chat.completions.create({
+    model: "gpt-4",
+    messages: [{
+      role: "user",
+      content: `${workflow.prompt}\n\nEmails:\n${emailTexts}`
+    }]
+  });
+  
+  // Save execution result
+  await prisma.workflowExecution.create({
+    data: {
+      workflowId,
+      summary: response.choices[0].message.content,
+      emailCount: emails.length
+    }
+  });
+}
+```
+
+In `src/jobs/workflow.job.ts`, set up Bull queue to run workflows:
+- Schedule workflows based on frequency
+- Update `nextRunAt` after each execution
+
+Create CRUD endpoints in `src/routes/workflows.routes.ts`:
+- `GET /api/workflows` - List user's workflows
+- `POST /api/workflows` - Create new workflow
+- `PUT /api/workflows/:id` - Update workflow
+- `DELETE /api/workflows/:id` - Delete workflow
+- `GET /api/workflows/:id/executions` - Get execution history
+
+### 2.9 Email Management Endpoints
+
+In `src/routes/emails.routes.ts`:
+- `GET /api/emails` - List emails with pagination, filters (label, date, search)
+- `GET /api/emails/:id` - Get single email with full body
+- `POST /api/emails/:id/labels` - Add label to email
+- `DELETE /api/emails/:id/labels/:labelId` - Remove label
+- `PATCH /api/emails/:id/read` - Mark as read/unread
+
+In `src/routes/labels.routes.ts`:
+- `GET /api/labels` - List user's labels
+- `POST /api/labels` - Create label
+- `PUT /api/labels/:id` - Update label
+- `DELETE /api/labels/:id` - Delete label
+
+### 2.10 Setup Express Server
+
+In `src/index.ts`:
+- Initialize Express app
+- Configure CORS for frontend
+- Add rate limiting middleware
+- Mount all routes
+- Add error handling middleware
+- Start server on port 3000
+
+Create `.env.example`:
+```
+DATABASE_URL=postgresql://user:password@localhost:5432/email_manager
+GOOGLE_CLIENT_ID=your_google_client_id
+GOOGLE_CLIENT_SECRET=your_google_client_secret
+GOOGLE_REDIRECT_URI=http://localhost:3000/auth/google/callback
+MICROSOFT_CLIENT_ID=your_microsoft_client_id
+MICROSOFT_CLIENT_SECRET=your_microsoft_client_secret
+MICROSOFT_REDIRECT_URI=http://localhost:3000/auth/microsoft/callback
+OPENAI_API_KEY=your_openai_api_key
+JWT_SECRET=your_jwt_secret
+FRONTEND_URL=http://localhost:5173
+GMAIL_PUBSUB_TOPIC=projects/your-project/topics/gmail-notifications
+```
+
+## Step 3: Shared Types
+
+In `shared/src/types.ts`, define TypeScript interfaces:
+```typescript
+export interface User {
+  id: string;
+  email: string;
+  name?: string;
+  createdAt: Date;
+}
+
+export interface EmailAccount {
+  id: string;
+  provider: 'gmail' | 'outlook';
+  email: string;
+  lastSyncedAt?: Date;
+}
+
+export interface Email {
+  id: string;
+  subject: string;
+  sender: string;
+  senderEmail: string;
+  receivedAt: Date;
+  bodyPreview: string;
+  bodyFull?: string;
+  isRead: boolean;
+  labels: Label[];
+}
+
+export interface Label {
+  id: string;
+  name: string;
+  color: string;
+  description?: string;
+  emailCount?: number;
+}
+
+export interface Workflow {
+  id: string;
+  name: string;
+  description?: string;
+  frequency: 'weekly' | 'biweekly';
+  filters: WorkflowFilters;
+  prompt: string;
+  isActive: boolean;
+  lastRunAt?: Date;
+  nextRunAt: Date;
+}
+
+export interface WorkflowFilters {
+  labelIds: string[];
+  keywords: string[];
+  dateRange?: { start: Date; end: Date };
+}
+
+export interface WorkflowExecution {
+  id: string;
+  workflowId: string;
+  summary: string;
+  emailCount: number;
+  executedAt: Date;
+}
+
+// API Response types
+export interface ApiResponse<T> {
+  data?: T;
+  error?: string;
+  message?: string;
+}
+
+export interface PaginatedResponse<T> {
+  data: T[];
+  total: number;
+  page: number;
+  pageSize: number;
+}
+```
+
+Create a `package.json` in `shared/` and configure it to export these types.
+
+## Step 4: Frontend Setup
+
+### 4.1 Initialize Frontend
+
+In the `frontend/` directory:
+- Initialize with Vite: `npm create vite@latest . -- --template react-ts`
+- Install dependencies: `react-router-dom`, `@tanstack/react-query`, `axios`, `recharts`, `tailwindcss`, `@headlessui/react`, `@heroicons/react`, `date-fns`
+- Configure Tailwind CSS
+
+### 4.2 Create Frontend Structure
+
+```
+src/
+├── components/
+│   ├── layout/
+│   │   ├── Navbar.tsx
+│   │   └── Sidebar.tsx
+│   ├── emails/
+│   │   ├── EmailList.tsx
+│   │   ├── EmailItem.tsx
+│   │   ├── EmailDetail.tsx
+│   │   └── EmailFilters.tsx
+│   ├── labels/
+│   │   ├── LabelBadge.tsx
+│   │   ├── LabelManager.tsx
+│   │   └── LabelForm.tsx
+│   ├── workflows/
+│   │   ├── WorkflowList.tsx
+│   │   ├── WorkflowForm.tsx
+│   │   └── WorkflowExecutions.tsx
+│   └── dashboard/
+│       ├── EmailVolumeChart.tsx
+│       ├── TopSendersChart.tsx
+│       └── StatsCards.tsx
+├── pages/
+│   ├── LoginPage.tsx
+│   ├── DashboardPage.tsx
+│   ├── EmailsPage.tsx
+│   ├── LabelsPage.tsx
+│   └── WorkflowsPage.tsx
+├── hooks/
+│   ├── useAuth.ts
+│   ├── useEmails.ts
+│   ├── useLabels.ts
+│   └── useWorkflows.ts
+├── services/
+│   └── api.ts
+├── utils/
+│   └── formatters.ts
+├── App.tsx
+└── main.tsx
+```
+
+### 4.3 Setup API Client
+
+In `src/services/api.ts`:
+```typescript
+import axios from 'axios';
+
+const api = axios.create({
+  baseURL: import.meta.env.VITE_API_URL || 'http://localhost:3000',
+  withCredentials: true
+});
+
+export const authApi = {
+  connectGmail: () => window.location.href = `${api.defaults.baseURL}/auth/google`,
+  connectOutlook: () => window.location.href = `${api.defaults.baseURL}/auth/microsoft`,
+  logout: () => api.post('/auth/logout')
+};
+
+export const emailsApi = {
+  list: (params: { page: number; labelId?: string; search?: string }) => 
+    api.get('/api/emails', { params }),
+  get: (id: string) => api.get(`/api/emails/${id}`),
+  classify: (id: string) => api.post(`/api/emails/${id}/classify`),
+  addLabel: (id: string, labelId: string) => 
+    api.post(`/api/emails/${id}/labels`, { labelId }),
+  removeLabel: (id: string, labelId: string) => 
+    api.delete(`/api/emails/${id}/labels/${labelId}`)
+};
+
+export const labelsApi = {
+  list: () => api.get('/api/labels'),
+  create: (data: { name: string; color: string; description?: string }) => 
+    api.post('/api/labels', data),
+  update: (id: string, data: Partial<Label>) => 
+    api.put(`/api/labels/${id}`, data),
+  delete: (id: string) => api.delete(`/api/labels/${id}`)
+};
+
+export const workflowsApi = {
+  list: () => api.get('/api/workflows'),
+  create: (data: WorkflowInput) => api.post('/api/workflows', data),
+  update: (id: string, data: Partial<WorkflowInput>) => 
+    api.put(`/api/workflows/${id}`, data),
+  delete: (id: string) => api.delete(`/api/workflows/${id}`),
+  executions: (id: string) => api.get(`/api/workflows/${id}/executions`)
+};
+
+export default api;
+```
+
+### 4.4 Setup React Query
+
+In `src/main.tsx`:
+```typescript
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: { refetchOnWindowFocus: false, retry: 1 }
+  }
+});
+
+ReactDOM.createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <QueryClientProvider client={queryClient}>
+      <App />
+    </QueryClientProvider>
+  </React.StrictMode>
+);
+```
+
+### 4.5 Create Custom Hooks
+
+In `src/hooks/useEmails.ts`:
+```typescript
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { emailsApi } from '../services/api';
+
+export function useEmails(filters: EmailFilters) {
+  return useQuery({
+    queryKey: ['emails', filters],
+    queryFn: () => emailsApi.list(filters)
+  });
+}
+
+export function useEmail(id: string) {
+  return useQuery({
+    queryKey: ['email', id],
+    queryFn: () => emailsApi.get(id),
+    enabled: !!id
+  });
+}
+
+export function useClassifyEmail() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => emailsApi.classify(id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['emails'] })
+  });
+}
+```
+
+Create similar hooks for labels and workflows.
+
+### 4.6 Build Authentication Flow
+
+In `src/pages/LoginPage.tsx`:
+```tsx
+export function LoginPage() {
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gray-50">
+      <div className="max-w-md w-full space-y-8 p-8 bg-white rounded-lg shadow">
+        <h2 className="text-3xl font-bold text-center">Email Manager</h2>
+        <p className="text-center text-gray-600">
+          Connect your email account to get started
+        </p>
+        <div className="space-y-4">
+          <button
+            onClick={() => authApi.connectGmail()}
+            className="w-full flex items-center justify-center px-4 py-3 border border-gray-300 rounded-md shadow-sm bg-white hover:bg-gray-50"
+          >
+            <img src="/gmail-icon.svg" className="w-6 h-6 mr-3" />
+            Connect Gmail
+          </button>
+          <button
+            onClick={() => authApi.connectOutlook()}
+            className="w-full flex items-center justify-center px-4 py-3 border border-gray-300 rounded-md shadow-sm bg-white hover:bg-gray-50"
+          >
+            <img src="/outlook-icon.svg" className="w-6 h-6 mr-3" />
+            Connect Outlook
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+### 4.7 Build Email Dashboard
+
+In `src/pages/EmailsPage.tsx`:
+- Create email list with infinite scroll
+- Add filters sidebar (labels, date range, search)
+- Implement email detail side panel that slides in on click
+- Show labels as colored badges
+- Add "Classify" button that calls AI classification
+- Add label dropdown to manually add/remove labels
+
+In `src/components/emails/EmailList.tsx`:
+```tsx
+export function EmailList({ filters }: { filters: EmailFilters }) {
+  const { data, isLoading } = useEmails(filters);
+  const [selectedEmailId, setSelectedEmailId] = useState<string | null>(null);
+  
+  return (
+    <div className="flex h-full">
+      <div className="flex-1 overflow-y-auto">
+        {data?.data.map(email => (
+          <EmailItem
+            key={email.id}
+            email={email}
+            onClick={() => setSelectedEmailId(email.id)}
+          />
+        ))}
+      </div>
+      {selectedEmailId && (
+        <EmailDetail
+          emailId={selectedEmailId}
+          onClose={() => setSelectedEmailId(null)}
+        />
+      )}
+    </div>
+  );
+}
+```
+
+### 4.8 Build Labels Management
+
+In `src/pages/LabelsPage.tsx`:
+- Display grid/list of labels with color indicators
+- Show email count per label
+- Add "Create Label" button opening a dialog
+- Label form with name, color picker, description
+- Edit and delete actions for each label
+
+### 4.9 Build Workflows Page
+
+In `src/pages/WorkflowsPage.tsx`:
+- List all workflows with status (active/inactive)
+- Show last run and next run times
+- "Create Workflow" button opens dialog with:
+  - Name and description fields
+  - Frequency dropdown (Weekly/Bi-weekly)
+  - Label multi-select
+  - Keywords input
+  - Date range picker
+  - Large text area for custom AI prompt
+- View execution history button for each workflow
+- Edit and delete actions
+
+In `src/components/workflows/WorkflowForm.tsx`:
+```tsx
+export function WorkflowForm({ workflow, onSubmit }: WorkflowFormProps) {
+  const { data: labels } = useLabels();
+  const [formData, setFormData] = useState({
+    name: workflow?.name || '',
+    description: workflow?.description || '',
+    frequency: workflow?.frequency || 'weekly',
+    filters: workflow?.filters || { labelIds: [], keywords: [] },
+    prompt: workflow?.prompt || 'Summarize these emails and highlight key information.'
+  });
+  
+  return (
+    <form onSubmit={(e) => { e.preventDefault(); onSubmit(formData); }}>
+      {/* Form fields */}
+    </form>
+  );
+}
+```
+
+### 4.10 Build Dashboard Visualizations
+
+In `src/pages/DashboardPage.tsx`:
+- Stats cards showing total emails, labels, active workflows
+- Email volume chart over time using Recharts LineChart
+- Top senders chart using BarChart
+- Labels distribution using PieChart
+- Recent workflow executions list
+
+In `src/components/dashboard/EmailVolumeChart.tsx`:
+```tsx
+import { LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid } from 'recharts';
+
+export function EmailVolumeChart({ data }: { data: ChartData[] }) {
+  return (
+    <div className="bg-white p-6 rounded-lg shadow">
+      <h3 className="text-lg font-semibold mb-4">Email Volume</h3>
+      <LineChart width={600} height={300} data={data}>
+        <CartesianGrid strokeDasharray="3 3" />
+        <XAxis dataKey="date" />
+        <YAxis />
+        <Tooltip />
+        <Line type="monotone" dataKey="count" stroke="#8884d8" />
+      </LineChart>
+    </div>
+  );
+}
+```
+
+### 4.11 Setup Routing
+
+In `src/App.tsx`:
+```tsx
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+
+function App() {
+  const { isAuthenticated } = useAuth();
+  
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route path="/login" element={<LoginPage />} />
+        <Route path="/auth/callback" element={<OAuthCallback />} />
+        <Route
+          path="/"
+          element={isAuthenticated ? <Layout /> : <Navigate to="/login" />}
+        >
+          <Route index element={<DashboardPage />} />
+          <Route path="emails" element={<EmailsPage />} />
+          <Route path="labels" element={<LabelsPage />} />
+          <Route path="workflows" element={<WorkflowsPage />} />
+        </Route>
+      </Routes>
+    </BrowserRouter>
+  );
+}
+```
+
+## Step 5: Docker Configuration
+
+Create `docker-compose.yml` in root:
+```yaml
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: emailmanager
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: email_manager
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  backend:
+    build: ./backend
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://emailmanager:password@postgres:5432/email_manager
+    depends_on:
+      - postgres
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_URL: http://localhost:3000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+
+volumes:
+  postgres_data:
+```
+
+Create `Dockerfile` in `backend/`:
+```dockerfile
+FROM node:18-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+RUN npx prisma generate
+EXPOSE 3000
+CMD ["npm", "run", "dev"]
+```
+
+Create `Dockerfile` in `frontend/`:
+```dockerfile
+FROM node:18-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+EXPOSE 5173
+CMD ["npm", "run", "dev"]
+```
+
+## Step 6: Documentation
+
+Create `README.md` in root:
+```markdown
+# Email Manager
+
+AI-powered email management application with Gmail and Outlook integration.
+
+## Features
+- OAuth2 integration with Gmail and Outlook
+- Real-time email sync via webhooks
+- AI-powered email classification
+- Custom label management
+- Automated email workflows with AI summaries
+- Dashboard with analytics and visualizations
+
+## Setup
+
+1. Clone repository
+2. Copy `.env.example` to `.env` and fill in credentials
+3. Run `docker-compose up`
+4. Access frontend at http://localhost:5173
+
+## Configuration
+
+### Google OAuth Setup
+1. Create project in Google Cloud Console
+2. Enable Gmail API
+3. Create OAuth 2.0 credentials
+4. Add authorized redirect URI: http://localhost:3000/auth/google/callback
+
+### Microsoft OAuth Setup
+1. Register app in Azure Portal
+2. Add Mail.Read permission
+3. Add redirect URI: http://localhost:3000/auth/microsoft/callback
+
+### OpenAI API
+Get API key from https://platform.openai.com/
+```
+
+## Implementation Checklist
+
+Follow these steps in order:
+
+1. Initialize project structure and install all dependencies
+2. Set up Prisma schema and run migrations
+3. Implement backend OAuth authentication routes
+4. Implement Gmail and Outlook email sync services
+5. Set up webhook endpoints and registration logic
+6. Implement AI classification service with OpenAI
+7. Implement workflow service and Bull job queue
+8. Create all backend API endpoints with proper error handling
+9. Set up frontend with React Router and TanStack Query
+10. Build authentication UI and OAuth callback handling
+11. Build email list, filters, and detail views
+12. Build labels management interface
+13. Build workflows creation and management interface
+14. Add dashboard with charts and visualizations
+15. Test OAuth flow with both Gmail and Outlook
+16. Test webhook reception and email sync
+17. Test AI classification and summarization
+18. Create Docker configuration for deployment
+19. Write comprehensive README with setup instructions
+
+## Security Notes
+
+- Store OAuth tokens encrypted in production
+- Use HTTPS in production for webhook endpoints
+- Implement rate limiting on all API endpoints
+- Validate and sanitize all user inputs
+- Use environment variables for all secrets
+- Implement proper CORS configuration
+- Add request logging and monitoring
